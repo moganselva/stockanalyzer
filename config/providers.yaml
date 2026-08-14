@@ -1,0 +1,33 @@
+# Data source priority, rate limits, retry policy. CLAUDE.md §2, §3.1 rule 5.
+#
+# stooq is listed as the price fallback per CLAUDE.md §7 even though it is
+# currently blocked by an anti-bot JS challenge (see
+# src/stock_analyzer/data/providers/stooq_provider.py) — the config declares
+# intent, the code degrades gracefully when a listed source is unreachable.
+
+priority:
+  price: [yfinance, stooq]
+  currency: [yfinance]
+  fundamentals: [yfinance]
+  fx: [yfinance]
+
+rate_limits:
+  yfinance:
+    requests_per_second: 2
+    burst: 5
+  stooq:
+    requests_per_second: 1
+    burst: 3
+
+retry:
+  max_attempts: 3
+  backoff_base_seconds: 1
+  backoff_max_seconds: 10
+
+cache_ttl_seconds:
+  intraday: 900
+  eod: 43200
+  fundamentals: 86400
+  filings: 86400
+  macro: 86400
+  static: 2592000

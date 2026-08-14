@@ -1,0 +1,43 @@
+# Markets, exchanges, and ticker identity overrides. CLAUDE.md §2, §7.
+#
+# ISINs are filled in only where independently verified against public reference
+# data; unverified ones are left null rather than guessed — CLAUDE.md §3.1 rule 4,
+# "missing is missing."
+
+base_currency: USD
+
+markets:
+  US:
+    exchanges: [NMS, NYQ, NGM]
+    fiscal_year_end_month: 12
+    conviction_ceiling: 1.0
+  JP:
+    exchanges: [JPX]
+    fiscal_year_end_month: 3
+    conviction_ceiling: 0.9
+  NL:
+    exchanges: [AMS]
+    fiscal_year_end_month: 12
+    conviction_ceiling: 0.95
+  HK:
+    exchanges: [HKG]
+    fiscal_year_end_month: 12
+    # EM-adjacent data lag per CLAUDE.md §7 "EM data is thin and late" — HK filings
+    # arrive later and analyst coverage is thinner than US/EU large caps.
+    conviction_ceiling: 0.75
+
+# M1 pilot tickers (CLAUDE.md §5 M1 acceptance command). Manual override map — the
+# starting point CLAUDE.md §7 calls for, not a solved problem.
+tickers:
+  AAPL:
+    market: US
+    isin: US0378331005
+  7203.T:
+    market: JP
+    isin: JP3633400001
+  ASML.AS:
+    market: NL
+    isin: NL0010273215
+  1299.HK:
+    market: HK
+    isin: null # AIA Group — not independently verified yet, do not guess

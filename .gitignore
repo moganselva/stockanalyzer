@@ -1,8 +1,9 @@
 .env
 .env.*
-secrets/
-data/
-reports/
+.claude/settings.local.json
+/secrets/
+/data/
+/reports/
 __pycache__/
 *.py[cod]
 .mypy_cache/
