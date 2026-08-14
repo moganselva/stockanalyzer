@@ -103,6 +103,13 @@ actions:
 # ── Position sizing. Uncertainty is expressed here, not in the buy/sell label. ──
 sizing:
   base_weight_pct: 3.0
+  # Disclosed assumption, not a claim about any real account: a notional
+  # portfolio size used only to convert a position-size % into a dollar
+  # figure the G3 ADV/liquidity check can compare against. CLAUDE.md tech
+  # stack: "no magic constants in code" — this is the number that would
+  # otherwise be hardcoded, made an explicit, editable assumption instead.
+  reference_portfolio_value_usd: 10000000
+  vol_ratio_lookback_days: 30 # trailing window for the stock's own realized vol vs. its index
   formula: "base_weight * C * R * (1 / vol_ratio) * liquidity_cap"
   caps:
     single_name_pct:        5.0

@@ -11,20 +11,28 @@ markets:
     exchanges: [NMS, NYQ, NGM]
     fiscal_year_end_month: 12
     conviction_ceiling: 1.0
+    accessible: true # G3: no capital controls or foreign-ownership cap for US-listed equities
+    capital_controls: false
   JP:
     exchanges: [JPX]
     fiscal_year_end_month: 3
     conviction_ceiling: 0.9
+    accessible: true # Japan places no general foreign-ownership restriction on TSE-listed equities
+    capital_controls: false
   NL:
     exchanges: [AMS]
     fiscal_year_end_month: 12
     conviction_ceiling: 0.95
+    accessible: true # Euronext Amsterdam, EU freedom-of-capital-movement, no capital controls
+    capital_controls: false
   HK:
     exchanges: [HKG]
     fiscal_year_end_month: 12
     # EM-adjacent data lag per CLAUDE.md §7 "EM data is thin and late" — HK filings
     # arrive later and analyst coverage is thinner than US/EU large caps.
     conviction_ceiling: 0.75
+    accessible: true # Hong Kong has an open capital account, no general foreign-ownership cap
+    capital_controls: false
 
 # M1 pilot tickers (CLAUDE.md §5 M1 acceptance command). Manual override map — the
 # starting point CLAUDE.md §7 calls for, not a solved problem.

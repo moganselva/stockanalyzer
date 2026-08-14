@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -19,6 +21,15 @@ from .data.fetch import fetch_ticker
 from .data.normalize import resolve_market
 from .data.providers.stooq_provider import StooqProvider
 from .data.providers.yfinance_provider import YFinanceProvider
+from .decision.config import load_decision_rules
+from .decision.gates import GateContext, run_all_gates
+from .decision.scoring import (
+    LONG_HORIZON_FACTOR_MAP,
+    SHORT_HORIZON_FACTOR_MAP,
+    compute_composite,
+)
+from .decision.sizing import compute_sizing
+from .decision.tree import PositionContext, decide_action, timing_overlay
 from .factors.peers import build_peer_group
 from .factors.registry import (
     compute_factor,
@@ -513,6 +524,213 @@ def why(
             f"[yellow]note[/yellow] a {abs(result.stock_return):.1%} move with no identified "
             "cause — flagged for attention, not explained away."
         )
+
+
+_SIZEABLE_ACTIONS = {"strong_buy", "buy", "hold", "hold_trim"}
+
+
+@app.command()
+def decide(
+    ticker: str = typer.Argument(..., help="Ticker, e.g. AAPL"),  # noqa: B008
+    existing_position: bool = typer.Option(
+        False, "--existing-position", help="Evaluate as an existing holding, not a new entry."
+    ),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Full decision trace: Stage 1 gates, Stage 2 dual scores, Stage 3
+    action with hysteresis, and position sizing."""
+    decision_config = load_decision_rules()
+    fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    yfin = YFinanceProvider(offline_fixtures_dir=fixtures_dir)
+    stooq = StooqProvider(offline_fixtures_dir=fixtures_dir)
+    cache = None if offline_fixtures else Cache(DEFAULT_CACHE_PATH)
+
+    record = fetch_ticker(ticker, yfinance=yfin, stooq=stooq, base_currency="USD", cache=cache)
+    if cache is not None:
+        cache.close()
+
+    try:
+        peer_group = build_peer_group(ticker, yfin)
+    except ProviderError as exc:
+        console.print(f"[red]FAIL[/red] {ticker}: {exc}")
+        raise typer.Exit(code=1) from None
+    ctx = peer_group[ticker]
+    info = ctx.snapshot.value
+
+    price_conflict = next((c for c in record.quality.conflicts if c.field == "price"), None)
+    # Found in review: the old expression reported 2 "agreeing" sources when
+    # BOTH providers actually failed (price in missing_fields, not
+    # single_sourced_fields) — a false PASS in exactly the case G0 exists to
+    # catch. 0/1/2 now map onto missing/single-sourced/cross-checked.
+    if "price" in record.quality.missing_fields:
+        sources_agreeing = 0
+    elif "price" in record.quality.single_sourced_fields:
+        sources_agreeing = 1
+    else:
+        sources_agreeing = 2
+
+    region = resolve_market(ticker)
+    universe_raw = yaml.safe_load(Path("config/universe.yaml").read_text())
+    market_accessible = universe_raw.get("markets", {}).get(region, {}).get("accessible")
+
+    ocf = info.get("operatingCashflow")
+    net_income = info.get("netIncomeToCommon")
+    ocf_to_ni = (
+        float(ocf) / float(net_income) if ocf is not None and net_income not in (None, 0) else None
+    )
+    total_debt = info.get("totalDebt")
+    total_cash = info.get("totalCash")
+    net_debt = (
+        float(total_debt) - float(total_cash)
+        if total_debt is not None and total_cash is not None
+        else None
+    )
+    ebitda = info.get("ebitda")
+    price = info.get("regularMarketPrice")
+    if price is None:
+        price = info.get("previousClose")
+
+    # Found in review: fundamentals_as_of was set from the snapshot's own
+    # as_of, which comes from regularMarketTime — a PRICE-TICK timestamp,
+    # not a filing date. That made the staleness check structurally unable
+    # to ever fail. Use the real fundamentals dates yfinance reports instead.
+    fundamentals_as_of = None
+    most_recent_quarter = info.get("mostRecentQuarter")
+    last_fiscal_year_end = info.get("lastFiscalYearEnd")
+    for ts in (most_recent_quarter, last_fiscal_year_end):
+        if ts is not None:
+            fundamentals_as_of = datetime.fromtimestamp(ts, tz=UTC).date()
+            break
+
+    # Found in review: average_volume * price in the LISTING currency was
+    # compared directly against a USD reference position with no FX
+    # conversion — silently wrong for every non-USD ticker (e.g. treating a
+    # JPY ADV figure as if it were already in dollars). Convert honestly, or
+    # leave None rather than guess.
+    average_daily_dollar_volume = None
+    average_volume = info.get("averageVolume")
+    quote_currency = info.get("currency")
+    if average_volume is not None and price is not None and quote_currency is not None:
+        native_adv = float(average_volume) * float(price)
+        if quote_currency == "USD":
+            average_daily_dollar_volume = native_adv
+        else:
+            try:
+                fx = yfin.get_fx_rate(quote_currency, "USD")
+                average_daily_dollar_volume = native_adv * fx.value
+            except ProviderError:
+                average_daily_dollar_volume = None
+
+    gate_ctx = GateContext(
+        ticker=ticker,
+        now=ctx.as_of,
+        sources_agreeing=sources_agreeing,
+        price_disagreement_pct=price_conflict.pct_spread if price_conflict else None,
+        fundamentals_as_of=fundamentals_as_of,
+        currency_resolved=record.currency is not None,
+        ocf_to_ni_trailing=ocf_to_ni,
+        net_debt=net_debt,
+        ebitda=float(ebitda) if ebitda is not None else None,
+        sector=info.get("sector"),
+        average_daily_dollar_volume=average_daily_dollar_volume,
+        market_accessible=market_accessible,
+        reference_position_usd=(
+            decision_config.sizing.reference_portfolio_value_usd
+            * (decision_config.sizing.base_weight_pct / 100.0)
+        ),
+    )
+    gate_trace = run_all_gates(gate_ctx, decision_config)
+
+    l_composite = compute_composite(
+        "L",
+        decision_config.scoring.long_horizon_weights,
+        LONG_HORIZON_FACTOR_MAP,
+        ctx,
+        peer_group,
+    )
+    s_composite = compute_composite(
+        "S",
+        decision_config.scoring.short_horizon_weights,
+        SHORT_HORIZON_FACTOR_MAP,
+        ctx,
+        peer_group,
+    )
+    conviction: float | None = None
+    if l_composite.value is not None:
+        conviction = max(
+            decision_config.scoring.conviction_min,
+            min(decision_config.scoring.conviction_max, gate_trace.data_completeness),
+        )
+
+    position = PositionContext.EXISTING if existing_position else PositionContext.NEW
+    action, action_reason = decide_action(
+        l_composite.value, conviction, gate_trace, decision_config, position
+    )
+    overlay = timing_overlay(l_composite.value, s_composite.value)
+
+    console.print(f"[bold]{ticker}[/bold] — decision trace as of {ctx.as_of}")
+    console.print()
+    console.print("[bold]Stage 1 — Gates[/bold]")
+    for result in gate_trace.results:
+        marker = "[red]VETO[/red]" if result.veto else "[green]clear[/green]"
+        console.print(f"  {result.gate}: {marker} — {result.reason}")
+        for check in result.checks:
+            symbol = {"pass": "+", "fail": "x", "not_evaluated": "?"}[check.status.value]
+            # Rich parses `[x]` as markup and silently drops it — found in
+            # review to swallow exactly the FAIL marker a human scans for.
+            # Escape the brackets so they render as literal text.
+            console.print(f"    \\[{symbol}] {check.name}: {check.detail}")
+    console.print()
+    console.print("[bold]Stage 2 — Scores[/bold]")
+    for composite in (l_composite, s_composite):
+        value_display = f"{composite.value:+.1f}" if composite.value is not None else "unavailable"
+        coverage = f"{composite.weight_coverage:.0%}"
+        console.print(f"  {composite.label}: {value_display} (weight coverage {coverage})")
+        for c in composite.components:
+            z_display = f"{c.directional_z:+.2f}" if c.directional_z is not None else "—"
+            console.print(f"    {c.name} (w={c.weight:.2f}): {z_display} — {c.note}")
+    conviction_display = f"{conviction:.2f}" if conviction is not None else "unavailable"
+    console.print(f"  conviction (C): {conviction_display}")
+    console.print()
+    console.print("[bold]Stage 3 — Action[/bold]")
+    console.print(f"  [bold]{action.value.upper()}[/bold] — {action_reason}")
+    console.print(f"  timing overlay: {overlay}")
+
+    if action.value in _SIZEABLE_ACTIONS:
+        attribution_config = load_attribution_config()
+        market_index = attribution_config.market_index_by_region.get(region)
+        console.print()
+        console.print("[bold]Sizing[/bold]")
+        try:
+            stock_hist = yfin.get_price_history(ticker).value
+            market_hist = yfin.get_price_history(market_index).value if market_index else []
+            sizing = compute_sizing(
+                conviction=conviction,
+                regime_multiplier=1.0,
+                stock_points=stock_hist,
+                market_points=market_hist,
+                as_of=ctx.as_of,
+                average_daily_dollar_volume=gate_ctx.average_daily_dollar_volume,
+                config=decision_config.sizing,
+                min_adv_multiple=decision_config.gates.investability.min_adv_multiple_of_position,
+            )
+            if not sizing.sizeable:
+                console.print(f"  [yellow]cannot size[/yellow] — {sizing.unsizeable_reason}")
+            else:
+                vol_ratio_display = (
+                    f"{sizing.vol_ratio:.2f}" if sizing.vol_ratio is not None else "n/a"
+                )
+                console.print(
+                    f"  weight: {sizing.capped_weight_pct:.2f}% "
+                    f"(raw {sizing.raw_weight_pct:.2f}%, vol_ratio {vol_ratio_display}, "
+                    f"liquidity_cap {sizing.liquidity_cap:.2f})"
+                )
+                if sizing.binding_cap:
+                    console.print(f"  [yellow]note[/yellow] capped by {sizing.binding_cap}")
+        except ProviderError as exc:
+            console.print(f"  [yellow]note[/yellow] sizing unavailable: {exc}")
 
 
 if __name__ == "__main__":
