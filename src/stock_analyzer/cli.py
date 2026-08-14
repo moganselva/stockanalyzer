@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,9 +38,14 @@ from .factors.registry import (
     validate_registry_matches_config,
     winsorized_zscore,
 )
+from .report.builder import build_report_payload
 from .valuation.config import load_valuation_config
 from .valuation.dcf import DcfAssumptions, DcfInputError, cost_of_equity, dcf_value_per_share
-from .valuation.inputs import ValuationInputError, ValuationInputs, gather_valuation_inputs
+from .valuation.inputs import (
+    ValuationInputError,
+    base_case_growth,
+    gather_valuation_inputs,
+)
 from .valuation.reverse_dcf import NoImpliedGrowthInRange, sensitivity_table, solve_implied_growth
 from .valuation.scenarios import ScenarioProbabilityError, run_scenarios
 
@@ -307,7 +313,7 @@ def value(
     if scenarios:
         try:
             analysis = run_scenarios(
-                base_growth=_base_case_growth(ticker, inputs),
+                base_growth=base_case_growth(inputs),
                 base_terminal_growth=valuation_config.terminal_growth,
                 base_cap_years=valuation_config.cap_years_default,
                 discount_rate=discount_rate,
@@ -360,7 +366,7 @@ def value(
         assumptions = DcfAssumptions(
             fcfe0=inputs.fcfe0,
             shares_outstanding=inputs.shares_outstanding,
-            growth_start=_base_case_growth(ticker, inputs),
+            growth_start=base_case_growth(inputs),
             terminal_growth=valuation_config.terminal_growth,
             cap_years=valuation_config.cap_years_default,
             discount_rate=discount_rate,
@@ -377,18 +383,6 @@ def value(
         f"{assumptions.terminal_growth:.2%} over {assumptions.cap_years}y) "
         f"vs price {inputs.current_price:,.2f} ({gap:+.1%} gap)"
     )
-
-
-def _base_case_growth(ticker: str, inputs: ValuationInputs) -> float:
-    """The forward DCF's base-case growth: the company's own trailing revenue
-    growth, taken as-is with no forecasting judgement applied — a disclosed
-    starting point pulled from trailing data, not an independent analyst
-    forecast. `analyze value --reverse` is the module actually meant to be
-    trusted for what the market is pricing in; this default view exists so a
-    plain `analyze value TICKER` still produces a real number to react to."""
-    if inputs.trailing_revenue_growth is None:
-        raise ValuationInputError(f"{ticker}: no trailing revenue growth available for a base case")
-    return inputs.trailing_revenue_growth
 
 
 def _parse_window(window: str) -> int:
@@ -731,6 +725,52 @@ def decide(
                     console.print(f"  [yellow]note[/yellow] capped by {sizing.binding_cap}")
         except ProviderError as exc:
             console.print(f"  [yellow]note[/yellow] sizing unavailable: {exc}")
+
+
+@app.command()
+def report(
+    ticker: str = typer.Argument(..., help="Ticker, e.g. AAPL"),  # noqa: B008
+    existing_position: bool = typer.Option(
+        False, "--existing-position", help="Evaluate as an existing holding, not a new entry."
+    ),
+    window: str = typer.Option("30d", "--window", help="Attribution window, e.g. 30d."),
+    output: Path | None = typer.Option(  # noqa: B008
+        None, "--output", "-o", help="Write the JSON payload to this file instead of stdout."
+    ),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Build the complete, self-contained JSON payload the reasoning layer
+    reads (prompts/MASTER_ANALYSIS.md Part B) — identity, price, data
+    quality, factor panel, valuation, attribution, and the full decision
+    trace for TICKER. Prints nothing but the JSON to stdout unless
+    --output is given, so it can be piped straight into a payload file."""
+    window_days = _parse_window(window)
+    try:
+        payload = build_report_payload(
+            ticker,
+            existing_position=existing_position,
+            window_days=window_days,
+            offline_fixtures=offline_fixtures,
+        )
+    except ProviderError as exc:
+        console.print(f"[red]FAIL[/red] {ticker}: {exc}")
+        raise typer.Exit(code=1) from None
+
+    # allow_nan=False: a NaN/Infinity anywhere in the payload would otherwise
+    # serialise as a bare `NaN` token — valid to Python's own json.loads, but
+    # rejected by JSON.parse/jq/every strict parser the reasoning layer or a
+    # downstream tool might use. Fail loudly here rather than silently ship
+    # a file that only THIS project's tests can read back.
+    rendered = json.dumps(payload, indent=2, allow_nan=False)
+    if output is not None:
+        output.write_text(rendered)
+        console.print(
+            f"[bold]{ticker}[/bold] — payload written to {output} ({len(rendered)} bytes)"
+        )
+    else:
+        print(rendered)
 
 
 if __name__ == "__main__":

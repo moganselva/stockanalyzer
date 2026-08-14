@@ -111,3 +111,17 @@ def gather_valuation_inputs(ticker: str, yfinance: YFinanceProvider) -> Valuatio
         operating_margin=operating_margin,
         trailing_revenue_growth=trailing_revenue_growth,
     )
+
+
+def base_case_growth(inputs: ValuationInputs) -> float:
+    """The forward DCF's base-case growth: the company's own trailing revenue
+    growth, taken as-is with no forecasting judgement applied — a disclosed
+    starting point pulled from trailing data, not an independent analyst
+    forecast. The reverse DCF is the module actually meant to be trusted for
+    what the market is pricing in; this default exists so a plain forward DCF
+    still produces a real number to react to."""
+    if inputs.trailing_revenue_growth is None:
+        raise ValuationInputError(
+            f"{inputs.ticker}: no trailing revenue growth available for a base case"
+        )
+    return inputs.trailing_revenue_growth
