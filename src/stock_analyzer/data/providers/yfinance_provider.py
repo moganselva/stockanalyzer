@@ -21,12 +21,14 @@ from ..base import (
     PricePoint,
     PriceProvider,
     ProviderUnavailable,
+    RiskFreeRateProvider,
     SnapshotProvider,
     Value,
 )
 from ..ratelimit import TokenBucket
 
 _QUOTE_URL = "https://finance.yahoo.com/quote/{ticker}"
+_TNX_SYMBOL = "^TNX"  # CBOE 10-Year Treasury Note Yield Index, quoted in percent
 
 
 class YFinanceProvider(
@@ -36,6 +38,7 @@ class YFinanceProvider(
     FxProvider,
     SnapshotProvider,
     PriceHistoryProvider,
+    RiskFreeRateProvider,
 ):
     name = "yfinance"
 
@@ -172,6 +175,19 @@ class YFinanceProvider(
             source=self.name,
             as_of=_as_of_from_info(info),
             url=_QUOTE_URL.format(ticker=symbol),
+            confidence=0.85,
+        )
+
+    def get_risk_free_rate(self) -> Value[float]:
+        info = self._get_info(_TNX_SYMBOL)
+        yield_pct = info.get("regularMarketPrice")
+        if yield_pct is None:
+            raise ProviderUnavailable(f"yfinance has no price for {_TNX_SYMBOL!r}")
+        return Value(
+            value=float(yield_pct) / 100.0,
+            source=self.name,
+            as_of=_as_of_from_info(info),
+            url=_QUOTE_URL.format(ticker=_TNX_SYMBOL),
             confidence=0.85,
         )
 

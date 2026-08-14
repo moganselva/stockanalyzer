@@ -1,0 +1,55 @@
+# DCF / reverse-DCF assumptions. CLAUDE.md tech stack: "no magic constants in
+# code" — every judgment call the valuation engine makes lives here, not
+# hardcoded in src/stock_analyzer/valuation/.
+#
+# What's real vs. assumed:
+#   - risk_free_rate is NOT here — it's fetched live (yfinance ^TNX, the 10-Year
+#     Treasury yield) because a real market-observed rate exists for free.
+#   - equity_risk_premium IS here, as a declared assumption. There is no live,
+#     free, single-number source for this — it is inherently a judgment call in
+#     every DCF methodology, not a shortcut specific to this project. 4.5% sits
+#     inside the long-run US ERP range commonly cited (Damodaran's published
+#     estimates), not a fabricated number.
+#   - terminal_growth is a declared assumption, deliberately conservative
+#     (roughly long-run real GDP growth), not tied to any single company.
+
+discount_rate:
+  equity_risk_premium: 0.045
+  min_beta: 0.3 # floor a very low/negative beta rather than implying near-zero risk
+  max_beta: 3.0 # cap an extreme beta rather than implying an implausible discount rate
+
+terminal_value:
+  terminal_growth: 0.025
+
+competitive_advantage_period:
+  default_years: 10 # CLAUDE.md §3.2 Block C: "how many years the spread survives"
+  min_years: 1
+  max_years: 25
+
+reverse_dcf:
+  # Bracket the solver searches for an implied growth rate. Deliberately wide —
+  # MILESTONES.md M3 goal: the solver must never silently clamp to a bound, so
+  # if a price needs growth outside even this range to justify, that IS the
+  # finding (extreme implied expectations), reported as "no solution in range",
+  # not quietly clipped to -50% or +300%.
+  min_implied_growth: -0.50
+  max_implied_growth: 3.00
+  sensitivity_discount_rate_deltas: [-0.01, 0.0, 0.01]
+  sensitivity_terminal_growth_deltas: [-0.005, 0.0, 0.005]
+
+# Bull/base/bear scenarios. Probabilities must sum to 1.0 (enforced in code).
+# Multipliers apply to the company's own current growth/margin trajectory, not
+# to an absolute number — CLAUDE.md §3.2 rule 8 spirit: relative, not raw.
+scenarios:
+  bull:
+    probability: 0.25
+    growth_multiplier: 1.5
+    cap_years_delta: 3
+  base:
+    probability: 0.50
+    growth_multiplier: 1.0
+    cap_years_delta: 0
+  bear:
+    probability: 0.25
+    growth_multiplier: 0.4
+    cap_years_delta: -4

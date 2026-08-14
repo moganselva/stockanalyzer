@@ -107,6 +107,16 @@ class FxProvider(ABC):
         """Units of quote_currency per 1 unit of base_currency."""
 
 
+class RiskFreeRateProvider(ABC):
+    """A source of the risk-free rate used to anchor a discount rate."""
+
+    name: ClassVar[str]
+
+    @abstractmethod
+    def get_risk_free_rate(self) -> Value[float]:
+        """Annualised risk-free rate as a decimal, e.g. 0.045 for 4.5%."""
+
+
 class SnapshotProvider(ABC):
     """A source of a raw fundamentals/metadata snapshot for factor computation.
 
