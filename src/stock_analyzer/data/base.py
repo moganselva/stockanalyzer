@@ -148,3 +148,22 @@ class PriceHistoryProvider(ABC):
     @abstractmethod
     def get_price_history(self, ticker: str, months: int) -> Value[list[PricePoint]]:
         """Chronological (oldest first) daily closes covering at least `months`."""
+
+
+@dataclass(frozen=True, slots=True)
+class EarningsEvent:
+    as_of: date
+    eps_estimate: float | None
+    eps_reported: float | None
+    surprise_pct: float | None
+
+
+class EarningsHistoryProvider(ABC):
+    """A source of dated, real earnings prints — the event tape's anchor."""
+
+    name: ClassVar[str]
+
+    @abstractmethod
+    def get_earnings_history(self, ticker: str) -> Value[list[EarningsEvent]]:
+        """Chronological (oldest first) earnings dates, past and near-future
+        scheduled, with estimate/reported/surprise where known."""

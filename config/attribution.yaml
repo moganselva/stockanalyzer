@@ -1,0 +1,44 @@
+# Market index and sector proxy mapping for return attribution.
+# docs/01_PRICE_ACTION_FRAMEWORK.md §2: "Strip the market... strip the style."
+#
+# Sector ETF mapping is US-only: SPDR sector ETFs are a clean, free, liquid
+# proxy for US GICS sectors. No equivalently standardized free sector index
+# exists for JP/NL/HK on free tiers — sector attribution is honestly reported
+# as unavailable for those markets, not approximated with a worse proxy.
+#
+# Style-factor attribution (§2 step 2: regress the residual on value/
+# momentum/size/quality/low-vol factor RETURNS) is not implemented at all —
+# constructing those returns needs a broad cross-sectional universe (long-
+# short factor portfolios), which this project's current pilot universe
+# cannot provide. Disclosed as unavailable, not approximated. Becomes
+# buildable once M9's screening universe exists.
+
+market_index_by_region:
+  US: "^GSPC"
+  JP: "^N225"
+  NL: "^AEX"
+  HK: "^HSI"
+
+sector_etf_by_us_sector:
+  Technology: XLK
+  Financial Services: XLF
+  Healthcare: XLV
+  Consumer Cyclical: XLY
+  Consumer Defensive: XLP
+  Energy: XLE
+  Industrials: XLI
+  Utilities: XLU
+  Real Estate: XLRE
+  Basic Materials: XLB
+  Communication Services: XLC
+
+regression:
+  lookback_months: 12 # trailing window used to fit empirical beta
+  min_observations: 60 # minimum paired daily returns required to trust a fitted beta
+
+event_tape:
+  # A window return this large or larger, with no matching earnings event,
+  # is flagged for the user's attention even though it stays "Unexplained" —
+  # docs/01_PRICE_ACTION_FRAMEWORK.md §2: "Unexplained... is a legitimate and
+  # required output," never papered over with an invented cause.
+  large_unexplained_move_threshold: 0.05

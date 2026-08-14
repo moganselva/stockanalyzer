@@ -9,9 +9,14 @@ from rich.console import Console
 from rich.table import Table
 
 from . import factors as _factors  # noqa: F401  (side effect: registers every factor)
+from .attribution.channel import classify_channel
+from .attribution.config import load_attribution_config
+from .attribution.decompose import InsufficientDataError, decompose
+from .attribution.events import earnings_events_in_window, label_confidence
 from .data.base import ProviderError
 from .data.cache import Cache
 from .data.fetch import fetch_ticker
+from .data.normalize import resolve_market
 from .data.providers.stooq_provider import StooqProvider
 from .data.providers.yfinance_provider import YFinanceProvider
 from .factors.peers import build_peer_group
@@ -373,6 +378,141 @@ def _base_case_growth(ticker: str, inputs: ValuationInputs) -> float:
     if inputs.trailing_revenue_growth is None:
         raise ValuationInputError(f"{ticker}: no trailing revenue growth available for a base case")
     return inputs.trailing_revenue_growth
+
+
+def _parse_window(window: str) -> int:
+    if not window.endswith("d"):
+        raise typer.BadParameter(f"only day windows are supported, e.g. '30d' — got {window!r}")
+    try:
+        days = int(window[:-1])
+    except ValueError as exc:
+        raise typer.BadParameter(f"could not parse day count from {window!r}") from exc
+    if days <= 0:
+        raise typer.BadParameter(f"window must be positive, got {days}")
+    return days
+
+
+@app.command()
+def why(
+    ticker: str = typer.Argument(..., help="Ticker, e.g. AAPL"),  # noqa: B008
+    window: str = typer.Option("30d", "--window", help="Attribution window, e.g. 30d."),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Decompose TICKER's return over --window into market/sector/residual,
+    match the residual against real earnings events, and report the share of
+    the move that could NOT be explained as an explicit headline number."""
+    window_days = _parse_window(window)
+    attribution_config = load_attribution_config()
+    fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    yfin = YFinanceProvider(offline_fixtures_dir=fixtures_dir)
+
+    region = resolve_market(ticker)
+    market_index = attribution_config.market_index_by_region.get(region)
+    if market_index is None:
+        console.print(f"[red]FAIL[/red] {ticker}: no market index configured for region {region!r}")
+        raise typer.Exit(code=1) from None
+
+    lookback = attribution_config.lookback_months
+    try:
+        stock_history = yfin.get_price_history(ticker, months=lookback)
+        market_history = yfin.get_price_history(market_index, months=lookback)
+        snapshot = yfin.get_snapshot(ticker)
+    except ProviderError as exc:
+        console.print(f"[red]FAIL[/red] {ticker}: {exc}")
+        raise typer.Exit(code=1) from None
+
+    sector = snapshot.value.get("sector")
+    sector_points = None
+    sector_unavailable_reason: str | None = None
+    if region != "US":
+        sector_unavailable_reason = f"no sector index proxy configured for region {region!r}"
+    elif sector is None:
+        sector_unavailable_reason = "no sector reported for this ticker"
+    elif sector not in attribution_config.sector_etf_by_us_sector:
+        sector_unavailable_reason = f"no ETF mapping configured for sector {sector!r}"
+    else:
+        sector_etf = attribution_config.sector_etf_by_us_sector[sector]
+        try:
+            sector_points = yfin.get_price_history(sector_etf, months=lookback).value
+        except ProviderError as exc:
+            sector_unavailable_reason = f"sector ETF {sector_etf} unavailable: {exc}"
+
+    try:
+        result = decompose(
+            ticker=ticker,
+            as_of=stock_history.as_of,
+            window_days=window_days,
+            stock_points=stock_history.value,
+            market_points=market_history.value,
+            min_observations=attribution_config.min_observations,
+            sector_points=sector_points,
+            sector_unavailable_reason=sector_unavailable_reason,
+        )
+    except InsufficientDataError as exc:
+        console.print(f"[red]FAIL[/red] {ticker}: {exc}")
+        raise typer.Exit(code=1) from None
+
+    try:
+        earnings = yfin.get_earnings_history(ticker)
+        matches = earnings_events_in_window(earnings.value, result.as_of, window_days)
+    except ProviderError:
+        matches = []
+    confidence, confidence_reason = label_confidence(result.residual, matches)
+    channel, channel_reason = classify_channel(result, confidence)
+
+    console.print(
+        f"[bold]{ticker}[/bold] — {window_days}d return {result.stock_return:+.2%} "
+        f"as of {result.as_of}"
+    )
+    console.print(f"  alpha (drift, {result.n_observations} obs): {result.alpha_component:+.2%}")
+    console.print(
+        f"  market: beta {result.market_beta:.2f} x index return "
+        f"{result.market_return:+.2%} = {result.market_component:+.2%}"
+    )
+    if result.sector_available:
+        console.print(
+            f"  sector: beta {result.sector_beta:.2f} x index return "
+            f"{result.sector_return:+.2%} = {result.sector_component:+.2%}"
+        )
+    else:
+        console.print(f"  sector: [dim]unavailable — {result.sector_unavailable_reason}[/dim]")
+    console.print("  style: [dim]unavailable — needs a broader universe than this pilot has[/dim]")
+    console.print(f"  residual: {result.residual:+.2%}")
+    console.print(
+        f"[bold]Unexplained: {result.unexplained_share:.0%} of the identified forces[/bold] "
+        f"({confidence.value}: {confidence_reason})"
+    )
+    if result.r_squared < 0.3:
+        console.print(
+            f"[yellow]note[/yellow] the market/sector regression has low explanatory power "
+            f"(R^2 {result.r_squared:.2f}) — treat the market/sector split above as a rough "
+            "signal, not a precise one; most of the stock's variance is unrelated to the index."
+        )
+    console.print(
+        "[dim]note the index used is not adjusted to exclude this stock — for a large index "
+        "constituent this inflates the fitted beta and understates the residual "
+        "(see attribution/decompose.py).[/dim]"
+    )
+    console.print(f"  channel: {channel.value} — {channel_reason}")
+    if matches:
+        console.print("  earnings events in window:")
+        for m in matches:
+            surprise = (
+                f"{m.event.surprise_pct:+.1f}%"
+                if m.event.surprise_pct is not None
+                else "not yet reported"
+            )
+            console.print(f"    {m.event.as_of} — surprise {surprise} ({m.days_before_as_of}d ago)")
+    if (
+        confidence.value == "Unexplained"
+        and abs(result.stock_return) >= attribution_config.large_unexplained_move_threshold
+    ):
+        console.print(
+            f"[yellow]note[/yellow] a {abs(result.stock_return):.1%} move with no identified "
+            "cause — flagged for attention, not explained away."
+        )
 
 
 if __name__ == "__main__":

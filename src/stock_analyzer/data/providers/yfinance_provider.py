@@ -15,6 +15,8 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ra
 
 from ..base import (
     CurrencyProvider,
+    EarningsEvent,
+    EarningsHistoryProvider,
     FundamentalsProvider,
     FxProvider,
     PriceHistoryProvider,
@@ -39,6 +41,7 @@ class YFinanceProvider(
     SnapshotProvider,
     PriceHistoryProvider,
     RiskFreeRateProvider,
+    EarningsHistoryProvider,
 ):
     name = "yfinance"
 
@@ -251,6 +254,96 @@ class YFinanceProvider(
             url=_QUOTE_URL.format(ticker=ticker),
             confidence=0.85,
         )
+
+    def _earnings_fixture_path(self, ticker: str) -> Path:
+        assert self._fixtures_dir is not None
+        return self._fixtures_dir / f"yfinance_earnings_{ticker.replace('.', '_')}.json"
+
+    def _load_earnings_fixture(self, ticker: str) -> list[EarningsEvent]:
+        path = self._earnings_fixture_path(ticker)
+        if not path.exists():
+            raise ProviderUnavailable(f"no offline earnings fixture for {ticker!r} at {path}")
+        rows = json.loads(path.read_text())
+        return _earnings_events_from_rows(rows)
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(ProviderUnavailable),
+    )
+    def _fetch_earnings_live(self, ticker: str) -> list[EarningsEvent]:
+        self._rate_limiter.acquire()
+        try:
+            df = yf.Ticker(ticker).earnings_dates
+        except Exception as exc:
+            raise ProviderUnavailable(
+                f"yfinance earnings_dates request failed for {ticker!r}: {exc}"
+            ) from exc
+        if df is None or df.empty:
+            raise ProviderUnavailable(f"yfinance returned no earnings dates for {ticker!r}")
+        rows = [
+            {
+                "date": idx.date().isoformat(),
+                "eps_estimate": row.get("EPS Estimate"),
+                "eps_reported": row.get("Reported EPS"),
+                "surprise_pct": row.get("Surprise(%)"),
+            }
+            for idx, row in df.iterrows()
+        ]
+        return _earnings_events_from_rows(rows)
+
+    def get_earnings_history(self, ticker: str) -> Value[list[EarningsEvent]]:
+        if self._fixtures_dir is not None:
+            events = self._load_earnings_fixture(ticker)
+        else:
+            events = self._fetch_earnings_live(ticker)
+        if not events:
+            raise ProviderUnavailable(f"yfinance has no usable earnings events for {ticker!r}")
+        events = sorted(events, key=lambda e: e.as_of)
+        # as_of must describe how fresh the DATA is, not the latest date the
+        # list happens to contain — the newest entry is often an unreported,
+        # scheduled FUTURE earnings date (confirmed for 1299.HK: its one
+        # fixture row is a print not yet due), which would date this Value
+        # after the moment it was actually fetched. Anchor on the last
+        # REPORTED print. If nothing has been reported yet at all (also
+        # 1299.HK's case — its only row is a future date with no report),
+        # there is no event-derived timestamp to trust, so fall back to "now"
+        # — the same convention _as_of_from_info already uses when a better
+        # timestamp isn't available.
+        reported = [e for e in events if e.eps_reported is not None]
+        as_of = reported[-1].as_of if reported else datetime.now(tz=UTC).date()
+        return Value(
+            value=events,
+            source=self.name,
+            as_of=as_of,
+            url=_QUOTE_URL.format(ticker=ticker),
+            confidence=0.8,
+        )
+
+
+def _earnings_events_from_rows(rows: list[dict[str, Any]]) -> list[EarningsEvent]:
+    events = []
+    for r in rows:
+        events.append(
+            EarningsEvent(
+                as_of=date.fromisoformat(r["date"]),
+                eps_estimate=_finite_or_none(r.get("eps_estimate")),
+                eps_reported=_finite_or_none(r.get("eps_reported")),
+                surprise_pct=_finite_or_none(r.get("surprise_pct")),
+            )
+        )
+    return events
+
+
+def _finite_or_none(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _points_from_rows(rows: list[dict[str, Any]]) -> list[PricePoint]:
