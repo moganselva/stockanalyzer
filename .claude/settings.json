@@ -1,0 +1,61 @@
+{
+  "$comment": "Project settings for Stock Analyzer. Commit this file. Secrets live in .env, never here.",
+
+  "model": "opusplan",
+
+  "permissions": {
+    "allow": [
+      "Bash(uv:*)",
+      "Bash(uv run:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(pytest:*)",
+      "Bash(ruff:*)",
+      "Bash(mypy:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout -b:*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(cat:*)",
+      "Bash(./scripts/verify_milestone.sh:*)",
+      "Read(//**)",
+      "Edit(src/**)",
+      "Edit(tests/**)",
+      "Edit(config/**)",
+      "Edit(docs/**)",
+      "Edit(prompts/**)",
+      "Write(src/**)",
+      "Write(tests/**)",
+      "Write(config/**)",
+      "Write(reports/**)"
+    ],
+
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(rm -rf:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Write(.env)",
+      "Write(.claude/settings.json)"
+    ]
+  },
+
+  "$comment_permissions": [
+    "git push is denied deliberately: an unattended session should never publish. Review and push yourself.",
+    "curl and wget are denied so that all network access goes through the versioned provider layer,",
+    "where it is rate-limited, cached, and provenance-tagged. Ad-hoc fetching bypasses every guarantee.",
+    "Reading .env is denied so an autonomous session cannot leak a key into a transcript or a commit."
+  ],
+
+  "env": {
+    "PYTHONHASHSEED": "0"
+  }
+}

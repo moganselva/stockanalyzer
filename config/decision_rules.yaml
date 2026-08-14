@@ -1,0 +1,120 @@
+# Decision rules — gates, scoring weights, action bands, sizing.
+# Edit this file, not the code. Every value here is a hypothesis to be validated by
+# walk-forward backtesting (CLAUDE.md M8), not a truth.
+
+version: 0.1.0
+
+# ── Stage 1: hard gates. Any failure → AVOID, with the triggering value reported. ──
+gates:
+  data_integrity:
+    min_sources_agreeing: 2
+    max_price_disagreement_pct: 2.0
+    max_fundamentals_age_days: 400
+    require_currency_resolved: true
+    require_share_class_resolved: true
+
+  accounting_quality:            # ≥ max_flags → AVOID
+    max_flags: 2
+    min_ocf_to_ni_3yr_avg: 0.70
+    max_accrual_ratio_percentile: 90
+    max_dso_growth_vs_revenue_growth_ratio: 1.5
+    max_dio_growth_vs_revenue_growth_ratio: 1.5
+    beneish_m_score_threshold: -1.78
+
+  solvency:
+    max_net_debt_to_ebitda: { default: 4.0, utilities: 6.0, financials: null, reits: 7.0 }
+    min_interest_cover: 2.0
+    max_months_to_unfunded_refi: 18
+    altman_z_distress_threshold: 1.81
+
+  investability:
+    min_adv_multiple_of_position: 20     # 20 days of ADV to exit
+    block_capital_controlled_markets: true
+    block_delisting_risk: true
+
+  governance_veto:
+    triggers: [fraud_allegation, auditor_resignation, restatement,
+               accounts_investigation, repeated_related_party_transfer]
+
+# ── Stage 2: dual scoring. Weights must sum to 1.0 within each block. ──
+scoring:
+  zscore:
+    winsorize_sigma: 3.0
+    buckets: [sector, region]            # never raw cross-market comparison
+
+  long_horizon:                          # L, −100…+100
+    valuation_margin_of_safety: 0.30
+    quality_and_moat:               0.25
+    growth_and_reinvestment:        0.20
+    capital_allocation:             0.15
+    governance_and_risk:            0.10
+
+  short_horizon:                         # S, −100…+100
+    earnings_revisions_and_sue:     0.30
+    price_momentum_12_1:            0.20
+    catalyst_proximity_and_skew:    0.20
+    positioning_and_flows:          0.15
+    sentiment_extremes_contrarian:  0.10
+    one_month_reversal_contrarian:  0.05
+
+  regime_multiplier:                     # R, applied to both scores
+    min: 0.5
+    max: 1.2
+    inputs: [real_yield_beta, credit_spread_beta, usd_beta, sector_cycle_position]
+
+  conviction:                            # C, 0.2…1.0
+    min: 0.2
+    max: 1.0
+    components:
+      data_completeness:   0.35
+      signal_agreement:    0.30
+      evidence_strength:   0.20
+      valuation_robustness: 0.15
+    # Markets with structurally thin data get a hard conviction ceiling.
+    market_ceilings:
+      default: 1.0
+      thin_estimate_coverage: 0.6        # set per-market in universe.yaml
+
+# ── Stage 3: action mapping. Hysteresis is mandatory — entry is stricter than exit. ──
+actions:
+  new_position:
+    strong_buy: { min_L: 40,  min_C: 0.6 }
+    buy:        { min_L: 20,  min_C: 0.5 }
+    no_action:  { L_range: [-20, 20] }
+    avoid:      { max_L: -20 }
+
+  existing_position:
+    hold:        { min_L: 10 }
+    hold_trim:   { L_range: [-10, 10] }
+    sell:        { max_L: -10 }
+
+  timing_overlay:                        # modifies execution, never the L verdict
+    L_high_S_high: buy_now_full_size
+    L_high_S_low:  stage_entry_await_revision_turn
+    L_low_S_high:  trade_only_small_size_hard_stop_dated_exit
+    L_low_S_low:   avoid
+
+  thesis_break_override:                 # immediate SELL regardless of score
+    - any_gate_newly_failed
+    - variant_claim_falsified
+    - roic_minus_wacc_negative_with_guided_reinvestment
+    - dilutive_or_subordinating_capital_event
+
+# ── Position sizing. Uncertainty is expressed here, not in the buy/sell label. ──
+sizing:
+  base_weight_pct: 3.0
+  formula: "base_weight * C * R * (1 / vol_ratio) * liquidity_cap"
+  caps:
+    single_name_pct:        5.0
+    sector_pct:            25.0
+    single_country_pct:    40.0
+    single_factor_active_risk_pct: 30.0
+
+# ── Prediction contract. All seven fields required or the output is rejected. ──
+predictions:
+  required_fields: [direction, magnitude_range, horizon, probability,
+                    mechanism, falsifier, confidence]
+  forbid_point_targets: true
+  auto_score_on_horizon_elapse: true
+  metrics: [hit_rate, magnitude_error, brier_score]
+  breakdown_by: [factor, horizon, market, conviction_bucket]
