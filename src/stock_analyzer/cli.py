@@ -1,4 +1,4 @@
-"""Stock Analyzer CLI. M1 scope: `analyze fetch`."""
+"""Stock Analyzer CLI. M1: `analyze fetch`. M2: `analyze factors`."""
 
 from __future__ import annotations
 
@@ -8,10 +8,18 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import factors as _factors  # noqa: F401  (side effect: registers every factor)
 from .data.cache import Cache
 from .data.fetch import fetch_ticker
 from .data.providers.stooq_provider import StooqProvider
 from .data.providers.yfinance_provider import YFinanceProvider
+from .factors.peers import build_peer_group
+from .factors.registry import (
+    compute_factor,
+    load_factor_config,
+    validate_registry_matches_config,
+    winsorized_zscore,
+)
 
 app = typer.Typer(help="Stock Analyzer — dual-horizon equity analysis on free-tier data.")
 console = Console()
@@ -81,6 +89,83 @@ def fetch(
         cache.close()
     if had_errors:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def factors(
+    ticker: str = typer.Argument(..., help="Ticker, e.g. AAPL"),  # noqa: B008
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Print every registered factor for TICKER: raw value, z-score, channel,
+    horizon, expected direction, and source."""
+    config = load_factor_config()
+    validate_registry_matches_config(config)
+
+    fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    yfin = YFinanceProvider(offline_fixtures_dir=fixtures_dir)
+
+    try:
+        peer_group = build_peer_group(ticker, yfin)
+    except Exception as exc:
+        console.print(f"[red]FAIL[/red] {ticker}: could not build snapshot — {exc}")
+        raise typer.Exit(code=1) from None
+
+    ctx = peer_group[ticker]
+    peer_count = len(peer_group)
+
+    table = Table(title=f"analyze factors {ticker} — peer bucket size {peer_count}")
+    table.add_column("Factor")
+    table.add_column("Value")
+    table.add_column("Z-score")
+    table.add_column("Signal")
+    table.add_column("Channel")
+    table.add_column("Horizon")
+    table.add_column("Direction")
+    table.add_column("Source")
+
+    for name in sorted(config):
+        definition = config[name]
+        raw = compute_factor(name, ctx)
+        if raw is None:
+            row_direction = "+" if definition.expected_direction == 1 else "-"
+            table.add_row(
+                name, "—", "—", "—", definition.channel, definition.horizon, row_direction, "—"
+            )
+            continue
+
+        peer_raw_values: dict[str, float] = {}
+        for peer_ticker, peer_ctx in peer_group.items():
+            peer_value = compute_factor(name, peer_ctx)
+            if peer_value is not None:
+                peer_raw_values[peer_ticker] = peer_value.value
+
+        z = winsorized_zscore(ticker, peer_raw_values)
+        if z is not None:
+            z_display = f"{z.z_score:+.2f} (n={z.peer_count})"
+            # z * expected_direction: a factor's raw z can be high while the
+            # *expected* price action is down (contrarian factors) — found in
+            # review that printing raw z next to a separate direction column
+            # is the likeliest place for that sign to get lost downstream.
+            # This column folds them together into one directly-readable number.
+            signal_display = f"{z.z_score * definition.expected_direction:+.2f}"
+        else:
+            z_display = "insufficient peers"
+            signal_display = "—"
+
+        table.add_row(
+            name,
+            f"{raw.value:+.4f}",
+            z_display,
+            signal_display,
+            definition.channel,
+            definition.horizon,
+            "+" if definition.expected_direction == 1 else "-",
+            raw.source,
+        )
+
+    console.print(table)
 
 
 if __name__ == "__main__":

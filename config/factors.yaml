@@ -1,0 +1,112 @@
+# Factor declarations. CLAUDE.md §3.2 rule 7: every factor is declared here with
+# channel, horizon, and expected direction — adding a factor means writing a new
+# @register_factor function plus an entry here, never touching the scoring engine
+# or registry.py. Rule 9: every factor declares its expected sign and the codebase
+# asserts it in tests (tests/test_factor_signs.py).
+#
+# channel: E (earnings/fundamentals) | M (market/pricing) | F (flows) | S (supply,
+#   i.e. share count) — see docs/01_PRICE_ACTION_FRAMEWORK.md §3.
+# expected_direction: 1 = higher factor value -> expected positive price action.
+#   -1 = higher factor value -> expected NEGATIVE price action (contrarian).
+# weight: placeholder for M5's scoring engine — unused by M2's registry/CLI.
+
+factors:
+  earnings_yield:
+    module: valuation
+    channel: M
+    horizon: long
+    expected_direction: 1
+    weight: 1.0
+    description: >
+      Trailing EPS / price (not 1/PE — well-defined for loss-makers too).
+      Cheap multiples mean-revert via re-rating, not fundamentals — Block A.
+
+  fcf_yield:
+    module: valuation
+    channel: M
+    horizon: long
+    expected_direction: 1
+    weight: 1.0
+    description: >
+      Free cash flow / market cap. Same mean-reversion mechanism as earnings
+      yield with a harder-to-manipulate numerator — Block A. None when
+      financialCurrency and quote currency differ (e.g. AIA Group reports in
+      USD but trades in HKD) — no cross-currency division without an as-of FX
+      rate M2 doesn't have yet.
+
+  return_on_equity:
+    module: quality
+    channel: E
+    horizon: long
+    expected_direction: 1
+    weight: 1.0
+    description: >
+      ROIC-WACC spread proxy. Sustained positive spread supports a
+      structurally higher multiple — Block C.
+
+  cash_conversion:
+    module: quality
+    channel: E
+    horizon: medium
+    expected_direction: 1
+    weight: 1.0
+    description: >
+      Operating cash flow / net income. Low cash conversion (high accruals)
+      is a robust negative-return anomaly, so this is oriented so higher is
+      better — Block C.
+
+  revenue_growth:
+    module: growth
+    channel: E
+    horizon: medium
+    expected_direction: 1
+    weight: 1.0
+    description: >
+      Trailing revenue growth. First-order proxy for Block D; the framework's
+      full mechanism (growth x (ROIC-WACC) x duration) needs a WACC estimate
+      M2 does not build.
+
+  momentum_12_1:
+    module: momentum
+    channel: M
+    horizon: short-medium
+    expected_direction: 1
+    weight: 1.0
+    description: >
+      Return from ~12 months ago to ~1 month ago. Under-reaction to gradually
+      diffusing information -> continuation over 3-12 months — Block E.
+
+  reversal_1m:
+    module: momentum
+    channel: M
+    horizon: short
+    expected_direction: -1
+    weight: 1.0
+    description: >
+      Trailing 1-month return. Liquidity provision / overshoot -> short-term
+      MEAN REVERSION — opposite sign to momentum_12_1 by design. Block E,
+      contrarian factor named explicitly in the M2 goal condition.
+
+  analyst_dispersion:
+    module: sentiment
+    channel: M
+    horizon: medium
+    expected_direction: -1
+    weight: 1.0
+    description: >
+      (target high - target low) / target mean — price-target dispersion, a
+      proxy for Diether-Malloy-Scherbina's EPS-forecast-dispersion result
+      (high dispersion -> lower future returns), not the same construct.
+      Confounded with analyst-coverage breadth on free-tier data. Block F,
+      contrarian factor named explicitly in the M2 goal condition.
+
+  short_interest_pct_float:
+    module: sentiment
+    channel: M
+    horizon: medium
+    expected_direction: -1
+    weight: 1.0
+    description: >
+      Short interest as % of float. Moderate short interest with no known
+      catalyst -> negative drift — Block F. Legitimately unavailable for most
+      non-US tickers on free tiers (CLAUDE.md §7 known trap).

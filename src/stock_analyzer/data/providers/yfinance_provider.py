@@ -5,6 +5,7 @@ single point of failure — see stooq_provider.py for the (currently blocked) fa
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,11 @@ from ..base import (
     CurrencyProvider,
     FundamentalsProvider,
     FxProvider,
+    PriceHistoryProvider,
+    PricePoint,
     PriceProvider,
     ProviderUnavailable,
+    SnapshotProvider,
     Value,
 )
 from ..ratelimit import TokenBucket
@@ -25,7 +29,14 @@ from ..ratelimit import TokenBucket
 _QUOTE_URL = "https://finance.yahoo.com/quote/{ticker}"
 
 
-class YFinanceProvider(PriceProvider, CurrencyProvider, FundamentalsProvider, FxProvider):
+class YFinanceProvider(
+    PriceProvider,
+    CurrencyProvider,
+    FundamentalsProvider,
+    FxProvider,
+    SnapshotProvider,
+    PriceHistoryProvider,
+):
     name = "yfinance"
 
     def __init__(
@@ -163,6 +174,85 @@ class YFinanceProvider(PriceProvider, CurrencyProvider, FundamentalsProvider, Fx
             url=_QUOTE_URL.format(ticker=symbol),
             confidence=0.85,
         )
+
+    def get_snapshot(self, ticker: str) -> Value[dict[str, Any]]:
+        info = self._get_info(ticker)
+        return Value(
+            value=info,
+            source=self.name,
+            as_of=_as_of_from_info(info),
+            url=_QUOTE_URL.format(ticker=ticker),
+            confidence=0.85,
+        )
+
+    def _history_fixture_path(self, ticker: str) -> Path:
+        assert self._fixtures_dir is not None
+        return self._fixtures_dir / f"yfinance_history_{ticker.replace('.', '_')}.json"
+
+    def _load_history_fixture(self, ticker: str) -> list[PricePoint]:
+        path = self._history_fixture_path(ticker)
+        if not path.exists():
+            raise ProviderUnavailable(f"no offline price-history fixture for {ticker!r} at {path}")
+        rows = json.loads(path.read_text())
+        return _points_from_rows(rows)
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(ProviderUnavailable),
+    )
+    def _fetch_history_live(self, ticker: str, months: int) -> list[PricePoint]:
+        self._rate_limiter.acquire()
+        # auto_adjust=True: split/dividend-adjusted closes. CLAUDE.md §7 known trap —
+        # momentum/reversal on raw closes produces fake jumps at split dates and
+        # ignores dividend reinvestment, corrupting the return series.
+        try:
+            history = yf.Ticker(ticker).history(period=f"{months}mo", auto_adjust=True)
+        except Exception as exc:
+            raise ProviderUnavailable(
+                f"yfinance history request failed for {ticker!r}: {exc}"
+            ) from exc
+        if history.empty:
+            raise ProviderUnavailable(f"yfinance returned no price history for {ticker!r}")
+        rows = [
+            {"date": idx.date().isoformat(), "close": row["Close"]}
+            for idx, row in history.iterrows()
+        ]
+        return _points_from_rows(rows)
+
+    def get_price_history(self, ticker: str, months: int = 14) -> Value[list[PricePoint]]:
+        if self._fixtures_dir is not None:
+            points = self._load_history_fixture(ticker)
+        else:
+            points = self._fetch_history_live(ticker, months)
+        if len(points) < 2:
+            raise ProviderUnavailable(f"yfinance has insufficient price history for {ticker!r}")
+        return Value(
+            value=points,
+            source=self.name,
+            as_of=points[-1].as_of,
+            url=_QUOTE_URL.format(ticker=ticker),
+            confidence=0.85,
+        )
+
+
+def _points_from_rows(rows: list[dict[str, Any]]) -> list[PricePoint]:
+    # Real, observed case (ASML.AS, 2026-08-14): the most recent day's close can
+    # come back as NaN before the session finalizes. A NaN silently poisons every
+    # return computed across it — drop the point rather than treat it as data.
+    # A None/non-numeric close (found in review: the old code called float()
+    # unguarded and would raise TypeError on a null) is dropped the same way.
+    points = []
+    for r in rows:
+        try:
+            close = float(r["close"])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(close):
+            continue
+        points.append(PricePoint(as_of=date.fromisoformat(r["date"]), close=close))
+    return points
 
 
 def _as_of_from_info(info: dict[str, Any]) -> date:

@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
-from typing import ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -105,3 +105,36 @@ class FxProvider(ABC):
     @abstractmethod
     def get_fx_rate(self, base_currency: str, quote_currency: str) -> Value[float]:
         """Units of quote_currency per 1 unit of base_currency."""
+
+
+class SnapshotProvider(ABC):
+    """A source of a raw fundamentals/metadata snapshot for factor computation.
+
+    Deliberately returns the provider's raw field dict rather than one typed method
+    per field — the factor library needs many loosely-related fields (sector,
+    margins, analyst targets) and a method per field would bloat this interface for
+    no real benefit. Factors extract named fields themselves and must treat a
+    missing key as missing, never impute (CLAUDE.md §3.1 rule 4).
+    """
+
+    name: ClassVar[str]
+
+    @abstractmethod
+    def get_snapshot(self, ticker: str) -> Value[dict[str, Any]]:
+        """Raw provider fields as of one point in time, with one shared provenance."""
+
+
+@dataclass(frozen=True, slots=True)
+class PricePoint:
+    as_of: date
+    close: float
+
+
+class PriceHistoryProvider(ABC):
+    """A source of a chronological daily-close series, for momentum/reversal factors."""
+
+    name: ClassVar[str]
+
+    @abstractmethod
+    def get_price_history(self, ticker: str, months: int) -> Value[list[PricePoint]]:
+        """Chronological (oldest first) daily closes covering at least `months`."""
