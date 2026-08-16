@@ -17,6 +17,7 @@ dependencies = [
     "yfinance>=1.6.0",
     "scipy>=1.17.1",
     "statsmodels>=0.14.6",
+    "plotly>=5.22",
 ]
 
 [project.scripts]
@@ -57,6 +58,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "statsmodels.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "plotly.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
