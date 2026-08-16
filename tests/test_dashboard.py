@@ -11,7 +11,7 @@ import pytest
 
 from stock_analyzer.data.base import PricePoint
 from stock_analyzer.report.builder import build_report_payload
-from stock_analyzer.report.dashboard import render_dashboard_html
+from stock_analyzer.report.dashboard import TickerDashboardData, render_dashboard_html
 
 PILOT_TICKERS = ["AAPL", "7203.T", "ASML.AS", "1299.HK"]
 
@@ -93,3 +93,64 @@ def test_dashboard_handles_a_completely_empty_payload_without_crashing() -> None
     doc = render_dashboard_html({})
     assert doc.startswith("<!DOCTYPE html>")
     assert doc.rstrip().endswith("</html>")
+
+
+# ---------------------------------------------------------------------------
+# Multi-ticker selector (found confusing/missing in user feedback on the
+# single-ticker version — now every ticker's full panel is embedded in one
+# document, toggled client-side, with a button per ticker in the header)
+# ---------------------------------------------------------------------------
+
+
+def _multi_ticker_data() -> list[TickerDashboardData]:
+    return [
+        TickerDashboardData(ticker=t, payload=build_report_payload(t, offline_fixtures=True))
+        for t in PILOT_TICKERS
+    ]
+
+
+def test_multi_ticker_dashboard_renders_a_selector_button_per_ticker() -> None:
+    doc = render_dashboard_html(tickers=_multi_ticker_data())
+    for ticker in PILOT_TICKERS:
+        safe_id = ticker.replace(".", "_")
+        assert f"id='nav-{safe_id}'" in doc
+        assert f"showTicker('{safe_id}')" in doc
+
+
+def test_multi_ticker_dashboard_embeds_every_tickers_panel() -> None:
+    doc = render_dashboard_html(tickers=_multi_ticker_data())
+    for ticker in PILOT_TICKERS:
+        safe_id = ticker.replace(".", "_")
+        assert f"id=\"ticker-{safe_id}\"" in doc
+
+
+def test_multi_ticker_dashboard_only_the_first_ticker_panel_is_visible_by_default() -> None:
+    data = _multi_ticker_data()
+    doc = render_dashboard_html(tickers=data)
+    first_id = data[0].ticker.replace(".", "_")
+    second_id = data[1].ticker.replace(".", "_")
+    assert f'<div id="ticker-{first_id}" class="ticker-panel" style="">' in doc
+    assert f'<div id="ticker-{second_id}" class="ticker-panel" style="display:none;">' in doc
+
+
+def test_multi_ticker_dashboard_embeds_plotlyjs_exactly_once() -> None:
+    """Regression risk: naively rendering N tickers' charts each with their
+    own inline plotly.js would multiply a ~4.5MB library by N. Checked by
+    size: a single-ticker document is dominated by the embedded library, so
+    a 4-ticker document must stay close to that same size, not roughly 4x
+    larger — the library should be embedded exactly once, with only each
+    ticker's own (much smaller) chart data adding to the total."""
+    single_doc = render_dashboard_html(build_report_payload("AAPL", offline_fixtures=True))
+    multi_doc = render_dashboard_html(tickers=_multi_ticker_data())
+    assert len(multi_doc) < len(single_doc) * 1.5
+    assert multi_doc.count("Plotly.newPlot") >= len(PILOT_TICKERS)  # one chart per ticker
+
+
+def test_single_payload_call_still_works_unchanged() -> None:
+    """Backward-compatible: the original single-ticker call signature must
+    keep working exactly as before for any caller that doesn't need the
+    multi-ticker selector."""
+    payload = build_report_payload("AAPL", offline_fixtures=True)
+    doc = render_dashboard_html(payload)
+    assert "id='nav-AAPL'" in doc
+    assert doc.count("ticker-panel") >= 1

@@ -50,7 +50,7 @@ from .predictions.contract import PredictionContractError, prediction_from_json
 from .predictions.log import append_predictions, read_predictions
 from .predictions.score import ScoreBucket, score_predictions, yfinance_price_lookup
 from .report.builder import build_report_payload
-from .report.dashboard import render_dashboard_html
+from .report.dashboard import TickerDashboardData, render_dashboard_html
 from .valuation.config import load_valuation_config
 from .valuation.dcf import DcfAssumptions, DcfInputError, cost_of_equity, dcf_value_per_share
 from .valuation.inputs import (
@@ -1202,51 +1202,72 @@ def screen(
 
 @app.command()
 def dashboard(
-    ticker: str = typer.Argument(..., help="Ticker, e.g. AAPL"),  # noqa: B008
+    tickers: list[str] | None = typer.Argument(  # noqa: B008
+        None, help="Tickers to include, e.g. AAPL 7203.T. Defaults to config/universe.yaml."
+    ),
     existing_position: bool = typer.Option(
         False, "--existing-position", help="Evaluate as an existing holding, not a new entry."
     ),
     window: str = typer.Option("30d", "--window", help="Attribution window, e.g. 30d."),
     output: Path | None = typer.Option(  # noqa: B008
-        None, "--output", "-o", help="Output HTML path. Defaults to reports/<ticker>.html."
+        None, "--output", "-o", help="Output HTML path. Defaults to reports/dashboard.html."
     ),
     offline_fixtures: bool = typer.Option(
         False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
     ),
 ) -> None:
-    """Build the M6 report payload and render it as one self-contained
-    static HTML dashboard — plotly.js is embedded inline, so the file opens
-    straight in a browser with no server and no network access needed to
-    view it (CLAUDE.md tech stack: "Charts: plotly -> static HTML"; "no
-    server dependency"). Every number shown traces to the same payload
-    `analyze report` prints as JSON — this command only changes how it is
-    displayed, never what it says."""
+    """Build the M6 report payload for each ticker and render them into one
+    self-contained static HTML dashboard with a ticker selector — plotly.js
+    is embedded inline exactly once, so the file opens straight in a
+    browser with no server and no network access needed to view it
+    (CLAUDE.md tech stack: "Charts: plotly -> static HTML"; "no server
+    dependency"). Every number shown traces to the same payload `analyze
+    report` prints as JSON for that ticker — this command only changes how
+    it is displayed, never what it says."""
+    if not tickers:
+        universe_raw = yaml.safe_load(Path("config/universe.yaml").read_text())
+        tickers = list(universe_raw.get("tickers", {}).keys())
+
     window_days = _parse_window(window)
-    try:
-        payload = build_report_payload(
-            ticker,
-            existing_position=existing_position,
-            window_days=window_days,
-            offline_fixtures=offline_fixtures,
-        )
-    except ProviderError as exc:
-        console.print(f"[red]FAIL[/red] {ticker}: {exc}")
-        raise typer.Exit(code=1) from None
-
     fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    # One shared provider (and its rate limiter) across every ticker in this
+    # run — matches the `screen` command's pattern, so pacing persists
+    # across the whole batch instead of resetting per ticker.
     yfin = YFinanceProvider(offline_fixtures_dir=fixtures_dir)
-    try:
-        price_points = yfin.get_price_history(ticker).value
-    except ProviderError as exc:
-        console.print(f"[yellow]note[/yellow] price history unavailable for the chart: {exc}")
-        price_points = None
 
-    html_doc = render_dashboard_html(payload, price_points)
-    output_path = output or Path(f"reports/{ticker.replace('.', '_')}_dashboard.html")
+    ticker_data: list[TickerDashboardData] = []
+    for ticker in tickers:
+        try:
+            payload = build_report_payload(
+                ticker,
+                existing_position=existing_position,
+                window_days=window_days,
+                offline_fixtures=offline_fixtures,
+            )
+        except ProviderError as exc:
+            console.print(f"[red]FAIL[/red] {ticker}: {exc} — skipped")
+            continue
+
+        try:
+            price_points = yfin.get_price_history(ticker).value
+        except ProviderError as exc:
+            console.print(f"[yellow]note[/yellow] {ticker}: price history unavailable: {exc}")
+            price_points = None
+
+        ticker_data.append(
+            TickerDashboardData(ticker=ticker, payload=payload, price_points=price_points)
+        )
+
+    if not ticker_data:
+        console.print("[red]FAIL[/red] no ticker produced a usable payload")
+        raise typer.Exit(code=1)
+
+    html_doc = render_dashboard_html(tickers=ticker_data)
+    output_path = output or Path("reports/dashboard.html")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_doc, encoding="utf-8")
     console.print(
-        f"[bold]{ticker}[/bold] — dashboard written to {output_path} "
+        f"[bold]{len(ticker_data)} ticker(s)[/bold] — dashboard written to {output_path} "
         f"({len(html_doc):,} bytes). Open it directly in a browser."
     )
 
