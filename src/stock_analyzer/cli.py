@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import typer
@@ -38,6 +38,10 @@ from .factors.registry import (
     validate_registry_matches_config,
     winsorized_zscore,
 )
+from .predictions.config import load_predictions_config
+from .predictions.contract import PredictionContractError, prediction_from_json
+from .predictions.log import append_predictions, read_predictions
+from .predictions.score import ScoreBucket, score_predictions, yfinance_price_lookup
 from .report.builder import build_report_payload
 from .valuation.config import load_valuation_config
 from .valuation.dcf import DcfAssumptions, DcfInputError, cost_of_equity, dcf_value_per_share
@@ -771,6 +775,110 @@ def report(
         )
     else:
         print(rendered)
+
+
+DEFAULT_PREDICTIONS_LOG_PATH = Path("data/predictions.jsonl")
+
+
+@app.command(name="log-predictions")
+def log_predictions_cmd(
+    file: Path = typer.Argument(  # noqa: B008
+        ..., help="JSON file: a single prediction object or a list of them."
+    ),
+) -> None:
+    """Validate a batch of predictions against the seven-field contract
+    (docs/01_PRICE_ACTION_FRAMEWORK.md §7) and append them to the
+    append-only prediction log. All-or-nothing: if any prediction in the
+    batch fails validation, none of them are logged."""
+    predictions_config = load_predictions_config()
+    try:
+        raw = json.loads(file.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]FAIL[/red] could not read {file}: {exc}")
+        raise typer.Exit(code=1) from None
+
+    raw_items = raw if isinstance(raw, list) else [raw]
+    records = []
+    parse_errors: list[str] = []
+    for i, item in enumerate(raw_items):
+        try:
+            records.append(prediction_from_json(item))
+        except (KeyError, ValueError, TypeError) as exc:
+            parse_errors.append(f"item {i}: {exc}")
+    if parse_errors:
+        console.print(f"[red]FAIL[/red] {len(parse_errors)} malformed prediction(s), none logged:")
+        for err in parse_errors:
+            console.print(f"  {err}")
+        raise typer.Exit(code=1)
+
+    try:
+        append_predictions(records, predictions_config.contract, DEFAULT_PREDICTIONS_LOG_PATH)
+    except PredictionContractError as exc:
+        console.print(f"[red]FAIL[/red] contract validation failed, none logged: {exc}")
+        raise typer.Exit(code=1) from None
+
+    console.print(
+        f"[bold]logged {len(records)} prediction(s)[/bold] to {DEFAULT_PREDICTIONS_LOG_PATH}"
+    )
+
+
+@app.command(name="score-predictions")
+def score_predictions_cmd(
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="Resolve as of this date (YYYY-MM-DD). Defaults to today."
+    ),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Resolve every elapsed prediction in the log against real price data
+    and print hit rate, magnitude error, and Brier score — overall, by
+    factor, and by horizon (docs/01_PRICE_ACTION_FRAMEWORK.md §7 /
+    CLAUDE.md §3.5 rule 16)."""
+    predictions_config = load_predictions_config()
+    records = read_predictions(DEFAULT_PREDICTIONS_LOG_PATH)
+    if not records:
+        console.print(
+            f"[yellow]no predictions logged yet[/yellow] at {DEFAULT_PREDICTIONS_LOG_PATH}"
+        )
+        return
+
+    as_of_date = date.fromisoformat(as_of) if as_of else datetime.now(tz=UTC).date()
+    fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    yfin = YFinanceProvider(offline_fixtures_dir=fixtures_dir)
+    lookup = yfinance_price_lookup(yfin, as_of_date, predictions_config.resolution)
+    report = score_predictions(records, as_of_date, lookup)
+
+    def _row(table: Table, bucket_label: str, bucket: ScoreBucket) -> None:
+        table.add_row(
+            bucket_label,
+            str(bucket.n),
+            f"{bucket.hit_rate:.0%}" if bucket.hit_rate is not None else "—",
+            f"{bucket.mean_magnitude_error:.2%}"
+            if bucket.mean_magnitude_error is not None
+            else "—",
+            f"{bucket.brier_score:.3f}" if bucket.brier_score is not None else "—",
+        )
+
+    table = Table(title=f"Prediction calibration — as of {as_of_date}")
+    table.add_column("Bucket")
+    table.add_column("n")
+    table.add_column("Hit rate")
+    table.add_column("Mean magnitude error")
+    table.add_column("Brier score")
+    _row(table, "overall", report.overall)
+    for label in sorted(report.by_horizon):
+        _row(table, f"horizon: {label}", report.by_horizon[label])
+    for label in sorted(report.by_factor):
+        _row(table, f"factor: {label}", report.by_factor[label])
+    console.print(table)
+
+    console.print(
+        f"pending (horizon not yet elapsed): {len(report.pending)}  |  "
+        f"unresolved (elapsed, no price data): {len(report.unresolved)}"
+    )
+    for record, reason in report.unresolved:
+        console.print(f"  [yellow]note[/yellow] {record.id} ({record.ticker}): {reason}")
 
 
 if __name__ == "__main__":

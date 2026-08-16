@@ -170,8 +170,44 @@ this market, so the entire revisions block is dark, which is the strongest short
 signal in the framework" is useful. "Data may be incomplete" is not.
 
 ## 11. Predictions Logged
-Emit a JSON block of every prediction made, in the seven-field contract format, ready for
-the prediction log.
+Emit a JSON array of every prediction made in this report (typically one SHORT and one LONG
+from section 5, plus the variant perception from section 7 if it is falsifiable on its own
+horizon). `analyze log-predictions <file>` (M7) reads exactly this shape — match it exactly,
+field names included, or the prediction will be rejected, not silently coerced:
+
+```json
+[
+  {
+    "id": "<TICKER>-<YYYY-MM-DD>-<short|long|variant>",
+    "ticker": "<TICKER>",
+    "as_of": "<payload's meta.as_of, YYYY-MM-DD>",
+    "reference_price": <payload's price.price_native.value, as a plain number>,
+    "direction": "up | down | range_bound",
+    "magnitude": { "low_pct": <float>, "high_pct": <float> },
+    "horizon": {
+      "start": "<YYYY-MM-DD, usually as_of>",
+      "end": "<YYYY-MM-DD>",
+      "label": "short | long"
+    },
+    "probability": <float, strictly between 0 and 1>,
+    "mechanism": { "factors": ["<factor names from payload.factors>"], "channel": "E | M | F | S" },
+    "falsifier": "<the specific observation from this report's own falsifier line>",
+    "confidence": "<free text, must name the specific data gaps that constrain it>"
+  }
+]
+```
+
+Rules the validator enforces (docs/01_PRICE_ACTION_FRAMEWORK.md §7 — do not try to work
+around any of these, a rejected batch logs nothing at all):
+- `magnitude.low_pct` must NOT equal `magnitude.high_pct` — a range, never a point target.
+- `magnitude.low_pct` must be <= `magnitude.high_pct`.
+- `horizon.end` must be strictly after `horizon.start`.
+- `probability` must be strictly between 0 and 1 — never 0 or 1, a "calibrated" forecast is
+  never certain.
+- `mechanism.channel` must be one of E / M / F / S. `mechanism.factors` may legitimately be an
+  empty list for a gate- or valuation-driven call — do not invent a factor name to fill it.
+- `falsifier` and `confidence` must be non-empty and specific — "market conditions change" is
+  not a falsifier, "may be wrong" is not a confidence statement.
 
 CLOSE WITH:
 "This is research and decision support, not investment advice. All views are probabilistic

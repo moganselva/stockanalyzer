@@ -1,0 +1,30 @@
+# Prediction Output Contract. docs/01_PRICE_ACTION_FRAMEWORK.md §7:
+# "Every prediction the system emits must carry all seven fields. A
+# prediction missing any of them is rejected by the output validator."
+#
+# CLAUDE.md §3.5 rule 16: every prediction is logged append-only and scored
+# when its horizon elapses. This file holds the tunable constants around
+# that contract and its resolution — never hardcoded in predictions/*.py.
+
+contract:
+  # A "calibrated" probability strictly between 0 and 1 — 0 or 1 would be an
+  # absurd claim of certainty for a probabilistic forecast, and the framework
+  # requires every prediction to be logged and scored, which is meaningless
+  # for a claim with no uncertainty at all.
+  min_probability: 0.0
+  max_probability: 1.0
+  probability_exclusive_bounds: true
+
+  # docs/01_PRICE_ACTION_FRAMEWORK.md §2 channel taxonomy: E (earnings
+  # expectations), M (multiple re-rating), F (mechanical flow), S (share
+  # count). A prediction's mechanism must name one of these.
+  valid_channels: ["E", "M", "F", "S"]
+
+  valid_horizon_labels: ["short", "long"]
+
+resolution:
+  # How close a price-history point must land to horizon.end to count as
+  # "the price at the horizon" — matches the tolerance data/priceseries.py's
+  # nearest_point() already uses elsewhere in this project (holidays,
+  # weekends, thin EM tape).
+  price_match_tolerance_days: 10
