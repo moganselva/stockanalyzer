@@ -24,6 +24,7 @@ from .data.base import ProviderError
 from .data.cache import Cache
 from .data.fetch import fetch_ticker
 from .data.normalize import resolve_market
+from .data.provider_config import load_providers_config
 from .data.providers.stooq_provider import StooqProvider
 from .data.providers.yfinance_provider import YFinanceProvider
 from .decision.config import load_decision_rules
@@ -1046,6 +1047,156 @@ def backtest(
             "  [dim]note: 2008/2020/2022-style stress-window splits are out of range for "
             "this project's fetched price history — see backtest/metrics.py[/dim]"
         )
+
+
+@app.command()
+def screen(
+    universe: Path = typer.Option(  # noqa: B008
+        Path("config/universe.yaml"), "--universe", help="Universe YAML file listing tickers."
+    ),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Screen a universe for data-quality gaps and reverse-DCF valuation
+    extremes. Cache-first and rate-limit-respecting across the WHOLE run:
+    one shared Cache and one shared, config-driven rate limiter per
+    provider are constructed ONCE before the ticker loop (not per ticker),
+    so pacing genuinely persists across the batch instead of resetting.
+    Core fetch fields (price/currency/shares/eps/name) are served through
+    the SQLite cache exactly like `analyze fetch`; valuation reads share
+    the same rate limiter for the whole run but are not independently
+    cached yet — a disclosed limitation, not a silent gap.
+
+    This project has never implemented an Alpha Vantage provider (its
+    ~25 req/day cap is the sharpest version of the fan-out risk this
+    command is designed against) — config/providers.yaml has no entry for
+    it, and the same shared-limiter + cache-first discipline here is what
+    would protect it too if one were added."""
+    providers_config = load_providers_config()
+    valuation_config = load_valuation_config()
+    fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    yfin = YFinanceProvider(
+        offline_fixtures_dir=fixtures_dir,
+        rate_limiter=providers_config.rate_limits["yfinance"].build_token_bucket(),
+    )
+    stooq = StooqProvider(
+        offline_fixtures_dir=fixtures_dir,
+        rate_limiter=providers_config.rate_limits["stooq"].build_token_bucket(),
+    )
+    cache = None if offline_fixtures else Cache(DEFAULT_CACHE_PATH)
+
+    universe_raw = yaml.safe_load(universe.read_text())
+    tickers = list(universe_raw.get("tickers", {}).keys())
+    base_currency = universe_raw.get("base_currency", "USD")
+    # `.get("screening", {})` only substitutes the default when the key is
+    # ABSENT — found in review that a `screening:` header left with an empty
+    # body parses as `None`, not `{}`, and `None.get(...)` raised a raw
+    # AttributeError before a single ticker was processed. `or {}` catches
+    # both "key absent" and "key present but empty."
+    screening_raw = universe_raw.get("screening") or {}
+    raw_threshold = screening_raw.get("large_implied_growth_gap", 0.15)
+    try:
+        large_gap_threshold = float(raw_threshold)
+        if large_gap_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        console.print(
+            f"[red]FAIL[/red] config/universe.yaml's screening.large_implied_growth_gap "
+            f"must be a positive number, got {raw_threshold!r}"
+        )
+        raise typer.Exit(code=1) from None
+
+    table = Table(title=f"analyze screen — {len(tickers)} tickers, {universe}")
+    table.add_column("Ticker")
+    table.add_column("Region")
+    table.add_column("Completeness")
+    table.add_column("Implied growth")
+    table.add_column("Trailing growth")
+    table.add_column("Gap")
+    table.add_column("Note")
+
+    # The risk-free rate (^TNX) is ticker-independent — found in review that
+    # fetching it fresh inside the per-ticker loop was wasteful and, for a
+    # genuinely rate-capped provider, exactly the redundant-request pressure
+    # this milestone is meant to guard against. One fetch for the whole run.
+    risk_free_rate_value: float | None = None
+    try:
+        risk_free_rate_value = yfin.get_risk_free_rate().value
+    except ProviderError as exc:
+        console.print(f"[yellow]note[/yellow] risk-free rate unavailable: {exc}")
+
+    try:
+        for ticker in tickers:
+            record = fetch_ticker(
+                ticker, yfinance=yfin, stooq=stooq, base_currency=base_currency, cache=cache
+            )
+            region = resolve_market(ticker)
+            implied_display, trailing_display, gap_display, note = "—", "—", "—", ""
+            if risk_free_rate_value is None:
+                note = "risk-free rate unavailable"
+                table.add_row(
+                    ticker,
+                    region,
+                    f"{record.quality.completeness:.0%}",
+                    implied_display,
+                    trailing_display,
+                    gap_display,
+                    note,
+                )
+                continue
+            try:
+                inputs = gather_valuation_inputs(ticker, yfin)
+                coe = cost_of_equity(
+                    risk_free_rate=risk_free_rate_value,
+                    beta=inputs.beta,
+                    equity_risk_premium=valuation_config.equity_risk_premium,
+                    min_beta=valuation_config.min_beta,
+                    max_beta=valuation_config.max_beta,
+                )
+                reverse = solve_implied_growth(
+                    current_price=inputs.current_price,
+                    fcfe0=inputs.fcfe0,
+                    shares_outstanding=inputs.shares_outstanding,
+                    terminal_growth=valuation_config.terminal_growth,
+                    cap_years=valuation_config.cap_years_default,
+                    discount_rate=coe.rate,
+                    min_growth=valuation_config.reverse_dcf_min_growth,
+                    max_growth=valuation_config.reverse_dcf_max_growth,
+                )
+                implied_display = f"{reverse.implied_growth:+.1%}"
+                if inputs.trailing_revenue_growth is not None:
+                    trailing_display = f"{inputs.trailing_revenue_growth:+.1%}"
+                    gap = reverse.implied_growth - inputs.trailing_revenue_growth
+                    gap_display = f"{gap:+.1%}"
+                    if abs(gap) >= large_gap_threshold:
+                        note = "[yellow]large implied-growth gap[/yellow]"
+                else:
+                    note = "no trailing growth to compare against"
+            except (
+                ValuationInputError,
+                ProviderError,
+                NoImpliedGrowthInRange,
+                DcfInputError,
+            ) as exc:
+                reason = str(exc)
+                truncated = reason if len(reason) <= 70 else reason[:67] + "..."
+                note = f"valuation unavailable: {truncated}"
+
+            table.add_row(
+                ticker,
+                region,
+                f"{record.quality.completeness:.0%}",
+                implied_display,
+                trailing_display,
+                gap_display,
+                note,
+            )
+    finally:
+        if cache is not None:
+            cache.close()
+
+    console.print(table)
 
 
 if __name__ == "__main__":

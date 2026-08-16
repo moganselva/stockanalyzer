@@ -49,3 +49,10 @@ tickers:
   1299.HK:
     market: HK
     isin: null # AIA Group — not independently verified yet, do not guess
+
+# `analyze screen` flagging threshold — how large a gap between the reverse-DCF
+# implied growth rate and the company's own trailing growth counts as worth
+# flagging for a closer look. Not a buy/sell signal on its own (see framework
+# §4 row 23), just a screen-level heuristic to sort attention toward.
+screening:
+  large_implied_growth_gap: 0.15
