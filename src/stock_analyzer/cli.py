@@ -16,6 +16,10 @@ from .attribution.channel import classify_channel
 from .attribution.config import load_attribution_config
 from .attribution.decompose import InsufficientDataError, decompose
 from .attribution.events import earnings_events_in_window, label_confidence
+from .backtest.config import load_backtest_config
+from .backtest.costs import round_trip_costs
+from .backtest.engine import MomentumConfig, PointInTimeSeries, RebalanceStep, run_walk_forward
+from .backtest.metrics import deflated_sharpe_ratio, sharpe_ratio, split_by_volatility_regime
 from .data.base import ProviderError
 from .data.cache import Cache
 from .data.fetch import fetch_ticker
@@ -33,11 +37,13 @@ from .decision.sizing import compute_sizing
 from .decision.tree import PositionContext, decide_action, timing_overlay
 from .factors.peers import build_peer_group
 from .factors.registry import (
+    FactorContext,
     compute_factor,
     load_factor_config,
     validate_registry_matches_config,
     winsorized_zscore,
 )
+from .factors.util import snapshot_field
 from .predictions.config import load_predictions_config
 from .predictions.contract import PredictionContractError, prediction_from_json
 from .predictions.log import append_predictions, read_predictions
@@ -879,6 +885,167 @@ def score_predictions_cmd(
     )
     for record, reason in report.unresolved:
         console.print(f"  [yellow]note[/yellow] {record.id} ({record.ticker}): {reason}")
+
+
+@app.command()
+def backtest(
+    tickers: list[str] | None = typer.Argument(  # noqa: B008
+        None, help="Tickers to backtest. Defaults to config/universe.yaml's pilot universe."
+    ),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Walk-forward backtest of a price-momentum signal, net of realistic
+    transaction costs, with the Deflated Sharpe Ratio correcting for the
+    number of configurations swept (docs/01_PRICE_ACTION_FRAMEWORK.md §8).
+    See backtest/engine.py's module docstring for this milestone's honestly
+    disclosed scope — a price-only signal, not the full gate/score decision
+    tree, which needs a point-in-time fundamentals store this project does
+    not have yet."""
+    backtest_config = load_backtest_config()
+    wf = backtest_config.walk_forward
+    fixtures_dir = DEFAULT_FIXTURES_DIR if offline_fixtures else None
+    yfin = YFinanceProvider(offline_fixtures_dir=fixtures_dir)
+
+    universe_raw = yaml.safe_load(Path("config/universe.yaml").read_text())
+    if not tickers:
+        tickers = list(universe_raw.get("tickers", {}).keys())
+    base_currency = universe_raw.get("base_currency", "USD")
+    periods_per_year = 365.0 / wf.rebalance_step_days
+
+    configs = [
+        MomentumConfig(
+            label=f"{d}d",
+            formation_days=d,
+            skip_days=wf.momentum_skip_days,
+            price_match_tolerance_days=wf.price_match_tolerance_days,
+            vol_lookback_days=wf.vol_regime_lookback_days,
+        )
+        for d in wf.momentum_formation_days_grid
+    ]
+    n_trials = len(configs)
+
+    for ticker in tickers:
+        try:
+            history = yfin.get_price_history(ticker)
+            snapshot = yfin.get_snapshot(ticker)
+        except ProviderError as exc:
+            console.print(f"[red]FAIL[/red] {ticker}: {exc}")
+            continue
+
+        series = PointInTimeSeries(ticker, history.value)
+        region = resolve_market(ticker)
+        ad_hoc_ctx = FactorContext(
+            ticker=ticker, as_of=snapshot.as_of, snapshot=snapshot, price_history=None
+        )
+        quote_currency = snapshot.value.get("currency")
+        is_cross_currency = quote_currency is not None and quote_currency != base_currency
+
+        # Found in quant-reviewer audit: average_volume * latest_close is in
+        # the ticker's LISTING currency, not automatically base_currency —
+        # multiplying it straight into a USD-denominated notional_trade_usd
+        # silently mispriced market impact for every non-USD pilot ticker
+        # (understated ~19-21bps for 7203.T/1299.HK). Same bug class already
+        # fixed once for the `decide` command's ADV liquidity check above —
+        # convert via the FX rate as of the price date, or leave None.
+        average_volume = snapshot_field(ad_hoc_ctx, "averageVolume")
+        latest_close = history.value[-1].close if history.value else None
+        average_daily_dollar_volume = None
+        if average_volume is not None and latest_close is not None and quote_currency is not None:
+            native_adv = average_volume * latest_close
+            if quote_currency == base_currency:
+                average_daily_dollar_volume = native_adv
+            else:
+                try:
+                    fx = yfin.get_fx_rate(quote_currency, base_currency)
+                    average_daily_dollar_volume = native_adv * fx.value
+                except ProviderError:
+                    average_daily_dollar_volume = None
+
+        trailing_dividend_yield = snapshot_field(ad_hoc_ctx, "trailingAnnualDividendYield")
+
+        console.print(
+            f"\n[bold]{ticker}[/bold] — walk-forward momentum backtest, {n_trials} configs"
+        )
+        table = Table()
+        table.add_column("Config")
+        table.add_column("n trades")
+        table.add_column("Gross Sharpe")
+        table.add_column("Net Sharpe")
+
+        best_label: str | None = None
+        best_net_returns: list[float] = []
+        best_net_sharpe = float("-inf")
+        best_steps: list[RebalanceStep] = []
+
+        for cfg in configs:
+            steps = run_walk_forward(series, cfg, wf.rebalance_step_days)
+            traded = [s for s in steps if s.position != 0 and s.forward_return is not None]
+            gross_returns = [s.forward_return for s in traded if s.forward_return is not None]
+
+            net_returns: list[float] = []
+            for s in traded:
+                assert s.forward_return is not None
+                try:
+                    costs = round_trip_costs(
+                        backtest_config.costs,
+                        market=region,
+                        position=s.position,
+                        holding_period_days=wf.rebalance_step_days,
+                        trade_value=backtest_config.costs.notional_trade_usd,
+                        average_daily_dollar_volume=average_daily_dollar_volume,
+                        is_cross_currency=is_cross_currency,
+                        trailing_dividend_yield=trailing_dividend_yield,
+                    )
+                except ValueError:
+                    continue
+                net_returns.append(s.forward_return - costs.total_bps / 10_000.0)
+
+            gross_sharpe = sharpe_ratio(gross_returns, periods_per_year)
+            net_sharpe = sharpe_ratio(net_returns, periods_per_year)
+            table.add_row(
+                cfg.label,
+                str(len(net_returns)),
+                f"{gross_sharpe:.2f}" if gross_sharpe is not None else "—",
+                f"{net_sharpe:.2f}" if net_sharpe is not None else "—",
+            )
+            if net_sharpe is not None and net_sharpe > best_net_sharpe:
+                best_net_sharpe = net_sharpe
+                best_label = cfg.label
+                best_net_returns = net_returns
+                best_steps = traded
+        console.print(table)
+
+        if best_label is None:
+            console.print("  [yellow]no config produced a scoreable return series[/yellow]")
+            continue
+
+        dsr = deflated_sharpe_ratio(best_net_returns, periods_per_year, n_trials)
+        if dsr is None:
+            console.print(
+                f"  best config: {best_label} — too few net trades to compute a "
+                "Deflated Sharpe Ratio"
+            )
+        else:
+            console.print(
+                f"  best config: {best_label}  |  "
+                f"raw net Sharpe {dsr.observed_sharpe_annualised:.2f}  |  "
+                f"Deflated Sharpe Ratio {dsr.deflated_sharpe:.3f} "
+                f"(P[true Sharpe > 0], corrected for {n_trials} configs tried)"
+            )
+
+        vols = [s.trailing_realized_vol for s in best_steps]
+        rets = [s.forward_return for s in best_steps if s.forward_return is not None]
+        if len(rets) == len(vols) and rets:
+            regime = split_by_volatility_regime(rets, vols, periods_per_year)
+            for label, bucket in regime.items():
+                sharpe_display = f"{bucket.sharpe:.2f}" if bucket.sharpe is not None else "—"
+                console.print(f"  regime {label}: n={bucket.n}, Sharpe={sharpe_display}")
+        console.print(
+            "  [dim]note: 2008/2020/2022-style stress-window splits are out of range for "
+            "this project's fetched price history — see backtest/metrics.py[/dim]"
+        )
 
 
 if __name__ == "__main__":

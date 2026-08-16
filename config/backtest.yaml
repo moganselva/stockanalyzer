@@ -1,0 +1,71 @@
+# Backtest engine assumptions. docs/01_PRICE_ACTION_FRAMEWORK.md §8:
+# "Realistic costs. Spread, market impact, FX conversion, dividend
+# withholding tax, and borrow costs. Free-data backtests that ignore these
+# routinely overstate returns by several percentage points a year."
+#
+# Every number below is a DISCLOSED ASSUMPTION, not a fitted or verified
+# fact about any specific broker/account — matching the same pattern as
+# config/decision_rules.yaml's reference_portfolio_value_usd and
+# config/valuation.yaml's equity_risk_premium. Withholding rates are
+# statutory DEFAULT rates (not treaty-adjusted for any investor's specific
+# domicile); real dividend withholding depends on the investor's tax
+# residency and any applicable treaty.
+
+costs:
+  # Half-spread cost in basis points, applied per trade side. Free-tier
+  # data has no real bid/ask feed, so these are disclosed estimates for
+  # liquid large-cap names in each market, not measured spreads.
+  half_spread_bps_by_market:
+    US: 2.0
+    JP: 5.0
+    NL: 4.0
+    HK: 8.0 # EM-adjacent liquidity, CLAUDE.md §7
+    default: 10.0 # any market not listed above — a conservative fallback, not a measured figure
+
+  # Square-root market-impact model (Almgren et al.): impact_bps =
+  # coefficient * sqrt(trade_value / average_daily_dollar_volume) * 10000.
+  # The coefficient is a standard order-of-magnitude default for this model
+  # family, not fit to this project's own trades.
+  impact_coefficient: 0.1
+
+  # Statutory dividend withholding tax rate by market (see module note
+  # above — NOT treaty-adjusted).
+  dividend_withholding_rate_by_market:
+    US: 0.30
+    JP: 0.15
+    NL: 0.15
+    HK: 0.0 # Hong Kong levies no withholding tax on dividends
+    default: 0.15
+
+  # Annualised borrow cost in basis points for short exposure — a single
+  # "general collateral, easy to borrow" default; this project has no
+  # per-ticker borrow-rate data source.
+  borrow_cost_bps_annual: 30.0
+
+  # FX conversion cost in basis points, applied once per trade for any
+  # ticker not already denominated in the backtest's base currency.
+  fx_conversion_cost_bps: 5.0
+
+  # Assumed notional trade size in USD — same order of magnitude as
+  # config/decision_rules.yaml's reference position (a disclosed
+  # assumption, not a claim about any real account), kept independent here
+  # since this module has its own ownership of backtest-specific constants.
+  notional_trade_usd: 300000.0
+
+walk_forward:
+  rebalance_step_days: 30
+  price_match_tolerance_days: 10
+  # The swept momentum-formation-window grid — "how many configurations
+  # were tested" for the Deflated Sharpe Ratio (framework §8: "Every
+  # parameter you try inflates the observed Sharpe. Apply the Deflated
+  # Sharpe Ratio ... and record the number of configurations tested.").
+  # skip_days stays fixed (excludes the most recent month, same convention
+  # as factors/momentum.py's momentum_12_1) — only the formation window is
+  # swept, so each entry is one genuinely distinct configuration.
+  momentum_formation_days_grid: [180, 270, 365, 450]
+  momentum_skip_days: 30
+
+  # Trailing realized-vol lookback used ONLY for the volatility-regime
+  # split (backtest/metrics.py's split_by_volatility_regime) — matches
+  # decision/sizing.py's vol_ratio_lookback_days convention.
+  vol_regime_lookback_days: 30
