@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # No secrets, no network calls: every check here runs offline against
+    # recorded fixtures (CLAUDE.md §3.1 rule 11), so a plain public runner
+    # with no credentials is sufficient.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Verify every milestone
+        # scripts/verify_milestone.sh is this project's own deterministic
+        # gate (ruff, mypy --strict, pytest, offline-only pytest, the
+        # anti-imputation grep, config parsing, no-secrets-committed, plus
+        # each milestone's specific acceptance check). Running all nine here
+        # is exactly the same command run locally after every change in this
+        # repo — CI is not a separate, weaker bar.
+        run: |
+          set -e
+          for m in 1 2 3 4 5 6 7 8 9; do
+            ./scripts/verify_milestone.sh "$m"
+          done
