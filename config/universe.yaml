@@ -40,6 +40,25 @@ tickers:
   AAPL:
     market: US
     isin: US0378331005
+  # AAPL's own (sector, region) bucket, brought up to 5 members so
+  # factors/registry.py's winsorized_zscore has enough real peers to
+  # compute an actual z-score instead of "insufficient peers" — sector,
+  # currency, and exchange independently verified live (2026-08-17) via
+  # yfinance before being added here, ISINs cross-checked against multiple
+  # independent public sources (not guessed). All four are US/Technology,
+  # same as AAPL.
+  MSFT:
+    market: US
+    isin: US5949181045
+  NVDA:
+    market: US
+    isin: US67066G1040
+  ORCL:
+    market: US
+    isin: US68389X1054
+  CRM:
+    market: US
+    isin: US79466L3024
   7203.T:
     market: JP
     isin: JP3633400001
