@@ -109,12 +109,13 @@ def _multi_ticker_data() -> list[TickerDashboardData]:
     ]
 
 
-def test_multi_ticker_dashboard_renders_a_selector_button_per_ticker() -> None:
+def test_multi_ticker_dashboard_renders_a_selector_dropdown_option_per_ticker() -> None:
     doc = render_dashboard_html(tickers=_multi_ticker_data())
+    assert "<select id=\"ticker-select\"" in doc
+    assert "onchange=\"showTicker(this.value)\"" in doc
     for ticker in PILOT_TICKERS:
         safe_id = ticker.replace(".", "_")
-        assert f"id='nav-{safe_id}'" in doc
-        assert f"showTicker('{safe_id}')" in doc
+        assert f"<option value='{safe_id}'>" in doc
 
 
 def test_multi_ticker_dashboard_embeds_every_tickers_panel() -> None:
@@ -152,5 +153,5 @@ def test_single_payload_call_still_works_unchanged() -> None:
     multi-ticker selector."""
     payload = build_report_payload("AAPL", offline_fixtures=True)
     doc = render_dashboard_html(payload)
-    assert "id='nav-AAPL'" in doc
+    assert "<option value='AAPL'>" in doc
     assert doc.count("ticker-panel") >= 1

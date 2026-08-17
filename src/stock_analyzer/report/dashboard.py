@@ -454,15 +454,11 @@ def render_dashboard_html(
     panels = "".join(
         _ticker_panel(t, js, active=(i == 0)) for i, t in enumerate(tickers)
     )
-    def _ticker_button(i: int, t: TickerDashboardData) -> str:
+    def _ticker_option(t: TickerDashboardData) -> str:
         safe_id = _esc(t.ticker).replace(".", "_")
-        active_class = " active" if i == 0 else ""
-        return (
-            f"<button id='nav-{safe_id}' class='ticker-btn{active_class}' "
-            f"onclick=\"showTicker('{safe_id}')\">{_esc(t.ticker)}</button>"
-        )
+        return f"<option value='{safe_id}'>{_esc(t.ticker)}</option>"
 
-    selector_buttons = "".join(_ticker_button(i, t) for i, t in enumerate(tickers))
+    selector_options = "".join(_ticker_option(t) for t in tickers)
     disclaimer = tickers[0].payload.get("disclaimer", "") if tickers else ""
     generated_at = datetime.now(tz=UTC).isoformat()
 
@@ -480,10 +476,10 @@ def render_dashboard_html(
             display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
   header .brand {{ font-weight: 700; font-size: 16px; margin-right: 12px; }}
   .ticker-select-label {{ color: #8b949e; font-size: 12px; margin-right: 4px; }}
-  .ticker-btn {{ background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
-                 border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 14px; }}
-  .ticker-btn.active {{ background: #2f81f7; color: white; border-color: #2f81f7; }}
-  .ticker-btn:hover {{ border-color: #2f81f7; }}
+  .ticker-select {{ background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+                     border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 14px;
+                     font-family: inherit; }}
+  .ticker-select:hover, .ticker-select:focus {{ border-color: #2f81f7; }}
   main {{ padding: 24px 32px; max-width: 1200px; margin: 0 auto; }}
   .ticker-head h1 {{ margin: 0 0 2px 0; font-size: 24px; }}
   .muted-inline {{ font-weight: 400; color: #57606a; font-size: 18px; }}
@@ -528,8 +524,10 @@ def render_dashboard_html(
 <body>
 <header>
   <span class="brand">Stock Analyzer</span>
-  <span class="ticker-select-label">Instrument:</span>
-  {selector_buttons}
+  <label class="ticker-select-label" for="ticker-select">Instrument:</label>
+  <select id="ticker-select" class="ticker-select" onchange="showTicker(this.value)">
+    {selector_options}
+  </select>
 </header>
 <main>
   {panels}
@@ -539,8 +537,6 @@ def render_dashboard_html(
 function showTicker(id) {{
   document.querySelectorAll('.ticker-panel').forEach(el => el.style.display = 'none');
   document.getElementById('ticker-' + id).style.display = 'block';
-  document.querySelectorAll('.ticker-btn').forEach(el => el.classList.remove('active'));
-  document.getElementById('nav-' + id).classList.add('active');
   window.dispatchEvent(new Event('resize'));
 }}
 function showTab(tickerId, tabId) {{
