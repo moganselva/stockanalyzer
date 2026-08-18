@@ -1272,5 +1272,27 @@ def dashboard(
     )
 
 
+@app.command(name="serve")
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
+    port: int = typer.Option(8000, "--port", help="Bind port."),
+    offline_fixtures: bool = typer.Option(
+        False, "--offline-fixtures", help="Read from recorded fixtures instead of live network."
+    ),
+) -> None:
+    """Run a local web server for on-demand ticker lookup — type any symbol,
+    not just the ones in config/universe.yaml. Not deployed anywhere by
+    default; see webapp.py's module docstring for the free-tier caveat
+    before pointing this at real traffic."""
+    import uvicorn
+
+    from .webapp import create_app
+
+    console.print(
+        f"[bold]Stock Analyzer[/bold] — open http://{host}:{port} in a browser. Ctrl+C to stop."
+    )
+    uvicorn.run(create_app(offline_fixtures=offline_fixtures), host=host, port=port)
+
+
 if __name__ == "__main__":
     app()
